@@ -1,0 +1,134 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Wanderlust AI – Your Intelligent Travel Companion</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--muted:#6b7280}
+body{font-family:Inter,system-ui,sans-serif;background:linear-gradient(180deg,#eaf6ff,#f7fbff);margin:0;}
+.wrap{max-width:1100px;margin:32px auto;display:grid;grid-template-columns:420px 1fr;gap:28px;padding:0 20px;}
+.header{grid-column:1/-1;display:flex;align-items:center;gap:18px;margin-bottom:10px;}
+.logo{width:88px;height:88px;border-radius:18px;overflow:hidden;box-shadow:0 8px 24px rgba(14,165,164,0.14)}
+.title h1{font-family:'Playfair Display',serif;margin:0;font-size:28px}
+.title p{margin:0;color:var(--muted)}
+.card{background:#fff;border-radius:14px;padding:22px;box-shadow:0 6px 18px rgba(15,23,42,0.06);}
+.label{font-size:12px;color:var(--muted);text-transform:uppercase;margin-bottom:8px;font-weight:700}
+textarea,input{width:100%;padding:12px;border-radius:10px;border:1px solid #e6eef6}
+.actions{display:flex;gap:12px;margin-top:14px}
+.btn{padding:10px 16px;border-radius:10px;border:none;cursor:pointer;font-weight:700}
+.btn-primary{background:linear-gradient(90deg,#06b6d4,#3b82f6);color:white}
+.config-section{margin-top:14px;padding:12px;border-radius:10px;background:#f8fbff;border:1px dashed #e6f2f9}
+.small{font-size:13px;color:var(--muted)}
+.panel .card{margin-bottom:18px}
+.jsonbox{background:#0f1724;color:#c2f0f3;padding:12px;border-radius:8px;max-height:300px;overflow:auto}
+@media(max-width:900px){.wrap{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <div class="logo"><img src="bde94426-bd64-4694-9195-6a1e5dd53f88.png" alt="logo" style="width:100%;height:100%;object-fit:cover"></div>
+    <div class="title"><h1>Wanderlust AI</h1><p>Your intelligent travel companion</p></div>
+    <div style="margin-left:auto"><button id="adminUnlock">Admin</button></div>
+  </div>
+
+  <div>
+    <div class="card">
+      <div class="label">Plan your journey</div>
+      <textarea id="user_text" rows="6">Plan a 5-day trip to Switzerland under $3500 USD</textarea>
+      <div style="margin-top:10px"><input id="user_id" placeholder="Traveller ID (optional)"></div>
+      <div class="actions">
+        <button class="btn btn-primary" id="planBtn">Plan Trip ✈️</button>
+        <button class="btn" id="clearBtn">Clear</button>
+      </div>
+
+      <!-- ADMIN CONFIG: hidden by default -->
+      <div id="adminConfig" class="config-section" style="display:none">
+        <div style="display:flex;gap:8px;align-items:center">
+          <div style="flex:1">
+            <div class="small">Endpoint (where the UI sends requests)</div>
+            <input id="apiEndpoint" placeholder="https://your-proxy.vercel.app/api/plan">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+          <div style="flex:1"><div class="small">Bearer token (optional)</div><input id="authToken" placeholder="Bearer token"></div>
+          <div><button id="saveConfig" class="btn">Save</button></div>
+        </div>
+        <div style="margin-top:10px"><label><input type="checkbox" id="testMode"> Test mode</label></div>
+        <div style="margin-top:8px" class="small">Config is stored locally in your browser.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="card">
+      <div class="label">Travel summary</div>
+      <div id="summary">Ready — enter a request and press Plan Trip.</div>
+    </div>
+
+    <div class="card">
+      <div class="label">Structured JSON</div>
+      <pre id="json" class="jsonbox">No data</pre>
+    </div>
+  </div>
+</div>
+
+<script>
+// simple admin unlock: password-protect the config UI
+const ADMIN_KEY = 'wanderlust_admin_unlocked_v1';
+const ADMIN_PASSWORD = 'admin123'; // change this to a secure password
+
+document.getElementById('adminUnlock').addEventListener('click', ()=>{
+  const unlocked = localStorage.getItem(ADMIN_KEY) === 'true';
+  if(unlocked){ // lock it
+    localStorage.removeItem(ADMIN_KEY);
+    document.getElementById('adminConfig').style.display = 'none';
+    document.getElementById('adminUnlock').textContent = 'Admin';
+    return;
+  }
+  const pw = prompt('Enter admin password to reveal endpoint config');
+  if(pw === ADMIN_PASSWORD){ localStorage.setItem(ADMIN_KEY,'true'); document.getElementById('adminConfig').style.display='block'; document.getElementById('adminUnlock').textContent='Admin (unlocked)'; }
+  else if(pw) alert('Incorrect password');
+});
+
+// show if already unlocked
+if(localStorage.getItem(ADMIN_KEY) === 'true'){ document.getElementById('adminConfig').style.display='block'; document.getElementById('adminUnlock').textContent='Admin (unlocked)'; }
+
+// basic behaviour for demo (no backend call)
+document.getElementById('planBtn').addEventListener('click', ()=>{
+  const text = document.getElementById('user_text').value.trim();
+  if(!text){ alert('Please enter a travel request'); return; }
+  document.getElementById('summary').textContent = 'Planning: ' + text;
+  // fake response for demo
+  setTimeout(()=>{
+    const demo = {
+      summary: '5-day Switzerland trip (demo) — Flights, hotels, local tours',
+      itinerary_cost: 3340,
+      days: 5,
+      items: [
+        {'day':1,'activity':'Arrival Zurich & city walk','cost_usd':180},
+        {'day':2,'activity':'Train to Interlaken & scenic ride','cost_usd':268}
+      ]
+    };
+    document.getElementById('summary').textContent = demo.summary;
+    document.getElementById('json').textContent = JSON.stringify(demo,null,2);
+  },900);
+});
+
+document.getElementById('clearBtn').addEventListener('click', ()=>{ document.getElementById('user_text').value=''; document.getElementById('user_id').value=''; document.getElementById('summary').textContent='Ready — enter a request and press Plan Trip.'; document.getElementById('json').textContent='No data'; });
+
+// save config
+document.getElementById('saveConfig').addEventListener('click', ()=>{
+  const ep = document.getElementById('apiEndpoint').value.trim();
+  const tok = document.getElementById('authToken').value.trim();
+  localStorage.setItem('wanderlust_endpoint', ep);
+  localStorage.setItem('wanderlust_token', tok);
+  alert('Endpoint saved locally');
+});
+</script>
+</body>
+</html>
