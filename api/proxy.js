@@ -1,18 +1,27 @@
 // api/proxy.js
-// Vercel serverless proxy with improved error handling
+// Vercel serverless proxy - avoids accessing req.body or req.query (reads raw request + URL manually)
 // Paste this file at /api/proxy.js, commit & push, then redeploy on Vercel.
+//
+// Required env vars:
+// - N8N_WEBHOOK_URL
+// - PROXY_SECRET
+// Optional:
+// - INTERNAL_AUTH_TOKEN
+// - RATE_LIMIT_MAX (default 20)
+// - RATE_LIMIT_WINDOW_MS (default 60000)
+// - FORWARD_TIMEOUT_MS (default 30000)
+// - ALLOWED_ORIGINS (comma-separated)
 
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const PROXY_SECRET = process.env.PROXY_SECRET;
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '20', 10);
 const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10);
 
-let rateMap = {}; // in-memory rate limiter (demo only)
+let rateMap = {};
 
 function getClientIp(req) {
   return req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
 }
-
 function isRateLimited(ip) {
   const now = Date.now();
   const e = rateMap[ip];
@@ -27,26 +36,36 @@ function isRateLimited(ip) {
   e.count += 1;
   return e.count > RATE_LIMIT_MAX;
 }
-
 function sendJson(res, status, payload) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify(payload));
 }
 
+// helper: parse query params from req.url manually (avoid req.query)
+function parseQueryParams(req) {
+  try {
+    const url = new URL(req.url, `https://${req.headers.host}`);
+    const obj = {};
+    for (const [k, v] of url.searchParams.entries()) obj[k] = v;
+    return obj;
+  } catch (e) {
+    return {};
+  }
+}
+
 module.exports = async (req, res) => {
   try {
-    // Basic server-side validation
     if (!N8N_WEBHOOK_URL) {
-      console.error('Missing N8N_WEBHOOK_URL env var');
+      console.error('Missing N8N_WEBHOOK_URL');
       return sendJson(res, 500, { error: 'Server misconfigured: missing N8N_WEBHOOK_URL' });
     }
     if (!PROXY_SECRET) {
-      console.error('Missing PROXY_SECRET env var');
+      console.error('Missing PROXY_SECRET');
       return sendJson(res, 500, { error: 'Server misconfigured: missing PROXY_SECRET' });
     }
 
-    // CORS (demo). For production, set exact origins in ALLOWED_ORIGINS.
+    // CORS (demo)
     const allowedOrigins = (process.env.ALLOWED_ORIGINS || '*').split(',');
     const origin = req.headers.origin || '*';
     if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
@@ -61,71 +80,44 @@ module.exports = async (req, res) => {
       return res.end();
     }
 
-    // 1) verify proxy secret
+    // validate secret (read header only)
     const providedSecret = (req.headers['x-proxy-secret'] || req.headers['authorization'] || '').toString();
     if (!providedSecret || providedSecret !== PROXY_SECRET) {
       return sendJson(res, 401, { error: 'Unauthorized - invalid proxy secret' });
     }
 
-    // 2) rate limit
+    // rate limit
     const ip = getClientIp(req);
     if (isRateLimited(ip)) {
       return sendJson(res, 429, { error: 'Rate limit exceeded' });
     }
 
-    // 3) payload size guard
+    // size guard using header only
     if (req.headers['content-length'] && parseInt(req.headers['content-length'], 10) > 200000) {
       return sendJson(res, 413, { error: 'Payload too large' });
     }
 
-    // 4) safely read raw request body for POST/PUT/PATCH
+    // read raw request body (do NOT reference req.body)
     let body = null;
     if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
-      try {
-        body = await new Promise((resolve, reject) => {
-          let data = '';
-          req.on('data', chunk => { data += chunk.toString(); });
-          req.on('end', () => resolve(data));
-          req.on('error', err => reject(err));
-        });
-        
-        // FIXED: Validate that body is valid JSON if Content-Type is JSON
-        const contentType = req.headers['content-type'] || '';
-        if (contentType.includes('application/json')) {
-          if (!body || body.trim() === '') {
-            console.warn('Empty body received, using default {}');
-            body = '{}';
-          } else {
-            // Validate JSON
-            try {
-              JSON.parse(body);
-              console.log('Valid JSON received:', body.substring(0, 100));
-            } catch (jsonErr) {
-              console.error('Invalid JSON received:', body.substring(0, 200));
-              return sendJson(res, 400, { 
-                error: 'Invalid JSON in request body',
-                details: jsonErr.message,
-                received: body.substring(0, 100) + '...'
-              });
-            }
-          }
-        } else {
-          // If not JSON, just use as-is
-          if (!body) body = '';
-        }
-      } catch (e) {
-        console.error('Failed to read request body:', e.message);
-        return sendJson(res, 400, { error: 'Failed to read request body', details: e.message });
-      }
+      body = await new Promise((resolve, reject) => {
+        let data = '';
+        req.on('data', chunk => { data += chunk; });
+        req.on('end', () => resolve(data));
+        req.on('error', err => reject(err));
+      }).catch(err => {
+        console.warn('raw body read failed', err && err.message);
+        return '{}';
+      });
+      if (!body) body = '{}';
     }
 
-    // 5) prepare forward URL (append query params if present)
-    const url = new URL(N8N_WEBHOOK_URL);
-    if (req.query) {
-      Object.keys(req.query).forEach(k => url.searchParams.append(k, req.query[k]));
-    }
+    // Build forward URL and append query params parsed manually
+    const forwardUrl = new URL(N8N_WEBHOOK_URL);
+    const q = parseQueryParams(req);
+    Object.keys(q).forEach(k => forwardUrl.searchParams.append(k, q[k]));
 
-    // 6) forward headers (include a proxy marker header that n8n can validate)
+    // Prepare forward headers
     const forwardHeaders = {
       'Content-Type': req.headers['content-type'] || 'application/json',
       'x-from-proxy': process.env.N8N_EXPECTED_PROXY_HEADER || 'vercel-proxy'
@@ -134,49 +126,32 @@ module.exports = async (req, res) => {
       forwardHeaders['x-internal-auth'] = process.env.INTERNAL_AUTH_TOKEN;
     }
 
-    // 7) forward request to upstream (global fetch available on Vercel)
+    // Forward request using global fetch
     const timeoutMs = parseInt(process.env.FORWARD_TIMEOUT_MS || '30000', 10);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    console.log('Forwarding to n8n:', url.toString());
-
-    const n8nResp = await fetch(url.toString(), {
+    const upstream = await fetch(forwardUrl.toString(), {
       method: req.method,
       headers: forwardHeaders,
       body: body,
       signal: controller.signal,
-    });
+    }).catch(err => { throw err; });
 
     clearTimeout(timeout);
 
-    // Read upstream response
-    const text = await n8nResp.text();
+    const text = await upstream.text();
     let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      console.warn('Upstream returned non-JSON:', text.substring(0, 100));
-      parsed = { raw: text };
-    }
+    try { parsed = JSON.parse(text); } catch (e) { parsed = { raw: text }; }
 
-    res.statusCode = n8nResp.status;
+    res.statusCode = upstream.status;
     res.setHeader('Content-Type', 'application/json');
-    return res.end(JSON.stringify({ 
-      forwarded: true, 
-      status: n8nResp.status, 
-      response: parsed 
-    }));
-    
+    return res.end(JSON.stringify({ forwarded: true, status: upstream.status, response: parsed }));
   } catch (err) {
-    // log the stack trace for Vercel function logs
     console.error('Proxy exception:', err && (err.stack || err.message || err));
     if (err && err.name === 'AbortError') {
       return sendJson(res, 504, { error: 'Upstream request timed out' });
     }
-    return sendJson(res, 500, { 
-      error: 'Proxy failed', 
-      details: err && (err.message || String(err))
-    });
+    return sendJson(res, 500, { error: 'Proxy failed', details: err && (err.message || String(err)) });
   }
 };
