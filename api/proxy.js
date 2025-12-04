@@ -1,16 +1,6 @@
 // api/proxy.js
-// Vercel serverless proxy (safe raw-body reading, no external deps)
+// Vercel serverless proxy with improved error handling
 // Paste this file at /api/proxy.js, commit & push, then redeploy on Vercel.
-//
-// Required env vars (set in Vercel Settings):
-// - N8N_WEBHOOK_URL  (e.g. https://your-n8n.example/webhook/xxx)
-// - PROXY_SECRET     (the secret your client sends in x-proxy-secret header)
-// Optional:
-// - INTERNAL_AUTH_TOKEN
-// - RATE_LIMIT_MAX (default 20)
-// - RATE_LIMIT_WINDOW_MS (default 60000)
-// - FORWARD_TIMEOUT_MS (default 30000)
-// - ALLOWED_ORIGINS (comma-separated, default '*')
 
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const PROXY_SECRET = process.env.PROXY_SECRET;
@@ -22,6 +12,7 @@ let rateMap = {}; // in-memory rate limiter (demo only)
 function getClientIp(req) {
   return req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
 }
+
 function isRateLimited(ip) {
   const now = Date.now();
   const e = rateMap[ip];
@@ -36,6 +27,7 @@ function isRateLimited(ip) {
   e.count += 1;
   return e.count > RATE_LIMIT_MAX;
 }
+
 function sendJson(res, status, payload) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
@@ -92,14 +84,38 @@ module.exports = async (req, res) => {
       try {
         body = await new Promise((resolve, reject) => {
           let data = '';
-          req.on('data', chunk => { data += chunk; });
+          req.on('data', chunk => { data += chunk.toString(); });
           req.on('end', () => resolve(data));
           req.on('error', err => reject(err));
         });
-        if (!body) body = '{}';
+        
+        // FIXED: Validate that body is valid JSON if Content-Type is JSON
+        const contentType = req.headers['content-type'] || '';
+        if (contentType.includes('application/json')) {
+          if (!body || body.trim() === '') {
+            console.warn('Empty body received, using default {}');
+            body = '{}';
+          } else {
+            // Validate JSON
+            try {
+              JSON.parse(body);
+              console.log('Valid JSON received:', body.substring(0, 100));
+            } catch (jsonErr) {
+              console.error('Invalid JSON received:', body.substring(0, 200));
+              return sendJson(res, 400, { 
+                error: 'Invalid JSON in request body',
+                details: jsonErr.message,
+                received: body.substring(0, 100) + '...'
+              });
+            }
+          }
+        } else {
+          // If not JSON, just use as-is
+          if (!body) body = '';
+        }
       } catch (e) {
-        console.warn('Failed to read raw body, defaulting to {}', e && e.message);
-        body = '{}';
+        console.error('Failed to read request body:', e.message);
+        return sendJson(res, 400, { error: 'Failed to read request body', details: e.message });
       }
     }
 
@@ -123,6 +139,8 @@ module.exports = async (req, res) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
+    console.log('Forwarding to n8n:', url.toString());
+
     const n8nResp = await fetch(url.toString(), {
       method: req.method,
       headers: forwardHeaders,
@@ -138,19 +156,27 @@ module.exports = async (req, res) => {
     try {
       parsed = JSON.parse(text);
     } catch (e) {
+      console.warn('Upstream returned non-JSON:', text.substring(0, 100));
       parsed = { raw: text };
     }
 
     res.statusCode = n8nResp.status;
     res.setHeader('Content-Type', 'application/json');
-    return res.end(JSON.stringify({ forwarded: true, status: n8nResp.status, response: parsed }));
+    return res.end(JSON.stringify({ 
+      forwarded: true, 
+      status: n8nResp.status, 
+      response: parsed 
+    }));
+    
   } catch (err) {
     // log the stack trace for Vercel function logs
     console.error('Proxy exception:', err && (err.stack || err.message || err));
     if (err && err.name === 'AbortError') {
       return sendJson(res, 504, { error: 'Upstream request timed out' });
     }
-    return sendJson(res, 500, { error: 'Proxy failed', details: err && (err.message || String(err)) });
+    return sendJson(res, 500, { 
+      error: 'Proxy failed', 
+      details: err && (err.message || String(err))
+    });
   }
 };
-
