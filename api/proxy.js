@@ -1,26 +1,24 @@
 // api/proxy.js
-// Vercel serverless proxy - avoids accessing req.body or req.query (reads raw request + URL manually)
-// Paste this file at /api/proxy.js, commit & push, then redeploy on Vercel.
+// Vercel Edge function (runtime: 'edge') — uses Request/Response API and avoids Node incoming-message JSON issues.
+// Paste this exact file, commit & push, then re-deploy on Vercel.
 //
-// Required env vars:
+// Required env vars in Vercel:
 // - N8N_WEBHOOK_URL
 // - PROXY_SECRET
-// Optional:
-// - INTERNAL_AUTH_TOKEN
-// - RATE_LIMIT_MAX (default 20)
-// - RATE_LIMIT_WINDOW_MS (default 60000)
-// - FORWARD_TIMEOUT_MS (default 30000)
-// - ALLOWED_ORIGINS (comma-separated)
+// Optional: INTERNAL_AUTH_TOKEN, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS, FORWARD_TIMEOUT_MS, ALLOWED_ORIGINS
+
+export const config = { runtime: 'edge' };
 
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const PROXY_SECRET = process.env.PROXY_SECRET;
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '20', 10);
 const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10);
 
-let rateMap = {};
+let rateMap = {}; // in-memory (edge ephemeral) rate limiter — okay for demo
 
 function getClientIp(req) {
-  return req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+  const forwarded = req.headers.get('x-forwarded-for');
+  return forwarded || (req.headers.get('x-vercel-ip-city') ? req.headers.get('x-vercel-ip-city') : 'unknown');
 }
 function isRateLimited(ip) {
   const now = Date.now();
@@ -36,122 +34,100 @@ function isRateLimited(ip) {
   e.count += 1;
   return e.count > RATE_LIMIT_MAX;
 }
-function sendJson(res, status, payload) {
-  res.statusCode = status;
-  res.setHeader('Content-Type', 'application/json');
-  res.end(JSON.stringify(payload));
+
+function jsonResponse(status, obj) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
-// helper: parse query params from req.url manually (avoid req.query)
-function parseQueryParams(req) {
-  try {
-    const url = new URL(req.url, `https://${req.headers.host}`);
-    const obj = {};
-    for (const [k, v] of url.searchParams.entries()) obj[k] = v;
-    return obj;
-  } catch (e) {
-    return {};
-  }
-}
-
-module.exports = async (req, res) => {
+export default async function handler(req) {
   try {
     if (!N8N_WEBHOOK_URL) {
       console.error('Missing N8N_WEBHOOK_URL');
-      return sendJson(res, 500, { error: 'Server misconfigured: missing N8N_WEBHOOK_URL' });
+      return jsonResponse(500, { error: 'Server misconfigured: missing N8N_WEBHOOK_URL' });
     }
     if (!PROXY_SECRET) {
       console.error('Missing PROXY_SECRET');
-      return sendJson(res, 500, { error: 'Server misconfigured: missing PROXY_SECRET' });
+      return jsonResponse(500, { error: 'Server misconfigured: missing PROXY_SECRET' });
     }
 
     // CORS (demo)
-    const allowedOrigins = (process.env.ALLOWED_ORIGINS || '*').split(',');
-    const origin = req.headers.origin || '*';
-    if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-    }
-    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-proxy-secret, Authorization, x-from-proxy, x-internal-auth');
-    res.setHeader('Access-Control-Max-Age', '600');
+    const origin = req.headers.get('origin') || '*';
+    const allowed = (process.env.ALLOWED_ORIGINS || '*').split(',');
+    const allowOrigin = (allowed.includes('*') || allowed.includes(origin)) ? origin : 'null';
 
     if (req.method === 'OPTIONS') {
-      res.statusCode = 204;
-      return res.end();
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': allowOrigin,
+          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, x-proxy-secret, Authorization, x-from-proxy, x-internal-auth',
+          'Access-Control-Max-Age': '600'
+        }
+      });
     }
 
-    // validate secret (read header only)
-    const providedSecret = (req.headers['x-proxy-secret'] || req.headers['authorization'] || '').toString();
+    // Validate secret (read header)
+    const providedSecret = (req.headers.get('x-proxy-secret') || req.headers.get('authorization') || '').toString();
     if (!providedSecret || providedSecret !== PROXY_SECRET) {
-      return sendJson(res, 401, { error: 'Unauthorized - invalid proxy secret' });
+      return new Response(JSON.stringify({ error: 'Unauthorized - invalid proxy secret' }), { status: 401, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': allowOrigin } });
     }
 
-    // rate limit
+    // Rate limiting (best-effort)
     const ip = getClientIp(req);
     if (isRateLimited(ip)) {
-      return sendJson(res, 429, { error: 'Rate limit exceeded' });
+      return new Response(JSON.stringify({ error: 'Rate limit exceeded' }), { status: 429, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': allowOrigin } });
     }
 
-    // size guard using header only
-    if (req.headers['content-length'] && parseInt(req.headers['content-length'], 10) > 200000) {
-      return sendJson(res, 413, { error: 'Payload too large' });
-    }
-
-    // read raw request body (do NOT reference req.body)
-    let body = null;
+    // Read raw body as text
+    let bodyText = null;
     if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
-      body = await new Promise((resolve, reject) => {
-        let data = '';
-        req.on('data', chunk => { data += chunk; });
-        req.on('end', () => resolve(data));
-        req.on('error', err => reject(err));
-      }).catch(err => {
-        console.warn('raw body read failed', err && err.message);
-        return '{}';
-      });
-      if (!body) body = '{}';
+      bodyText = await req.text();
+      if (!bodyText) bodyText = '{}';
     }
 
-    // Build forward URL and append query params parsed manually
+    // Build forward URL and copy query params
     const forwardUrl = new URL(N8N_WEBHOOK_URL);
-    const q = parseQueryParams(req);
-    Object.keys(q).forEach(k => forwardUrl.searchParams.append(k, q[k]));
+    const urlObj = new URL(req.url);
+    urlObj.searchParams.forEach((value, key) => forwardUrl.searchParams.append(key, value));
 
-    // Prepare forward headers
-    const forwardHeaders = {
-      'Content-Type': req.headers['content-type'] || 'application/json',
-      'x-from-proxy': process.env.N8N_EXPECTED_PROXY_HEADER || 'vercel-proxy'
-    };
-    if (process.env.INTERNAL_AUTH_TOKEN) {
-      forwardHeaders['x-internal-auth'] = process.env.INTERNAL_AUTH_TOKEN;
-    }
+    // Forward headers
+    const forwardHeaders = new Headers();
+    forwardHeaders.set('Content-Type', req.headers.get('content-type') || 'application/json');
+    forwardHeaders.set('x-from-proxy', process.env.N8N_EXPECTED_PROXY_HEADER || 'vercel-proxy');
+    if (process.env.INTERNAL_AUTH_TOKEN) forwardHeaders.set('x-internal-auth', process.env.INTERNAL_AUTH_TOKEN);
 
-    // Forward request using global fetch
+    // Forward request with timeout
     const timeoutMs = parseInt(process.env.FORWARD_TIMEOUT_MS || '30000', 10);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const id = setTimeout(() => controller.abort(), timeoutMs);
 
-    const upstream = await fetch(forwardUrl.toString(), {
+    const upstreamResp = await fetch(forwardUrl.toString(), {
       method: req.method,
       headers: forwardHeaders,
-      body: body,
-      signal: controller.signal,
-    }).catch(err => { throw err; });
+      body: bodyText,
+      signal: controller.signal
+    });
 
-    clearTimeout(timeout);
+    clearTimeout(id);
 
-    const text = await upstream.text();
+    const text = await upstreamResp.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch (e) { parsed = { raw: text }; }
 
-    res.statusCode = upstream.status;
-    res.setHeader('Content-Type', 'application/json');
-    return res.end(JSON.stringify({ forwarded: true, status: upstream.status, response: parsed }));
+    // Return upstream response wrapped
+    return new Response(JSON.stringify({ forwarded: true, status: upstreamResp.status, response: parsed }), {
+      status: upstreamResp.status,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': allowOrigin }
+    });
   } catch (err) {
     console.error('Proxy exception:', err && (err.stack || err.message || err));
     if (err && err.name === 'AbortError') {
-      return sendJson(res, 504, { error: 'Upstream request timed out' });
+      return jsonResponse(504, { error: 'Upstream request timed out' });
     }
-    return sendJson(res, 500, { error: 'Proxy failed', details: err && (err.message || String(err)) });
+    return jsonResponse(500, { error: 'Proxy failed', details: err && (err.message || String(err)) });
   }
-};
+}
