@@ -15,11 +15,20 @@ export default async function handler(request) {
   const forward = new URL(TARGET);
   url.searchParams.forEach((v, k) => forward.searchParams.append(k, v));
 
-  const upstream = await fetch(forward.toString(), {
-    method: request.method,
-    headers: { "Content-Type": request.headers.get("content-type") || "application/json", "x-from-proxy": "vercel-proxy" },
-    body: body || "{}",
-  });
+  const forwardHeaders = new Headers();
+forwardHeaders.set('Content-Type', request.headers.get('content-type') || 'application/json');
+forwardHeaders.set('x-from-proxy', 'vercel-proxy');
+
+// add internal auth header from Vercel env
+if (process.env.INTERNAL_AUTH_TOKEN) {
+  forwardHeaders.set('Authorization', `Bearer ${process.env.INTERNAL_AUTH_TOKEN}`);
+}
+
+const upstream = await fetch(forward.toString(), {
+  method: request.method,
+  headers: forwardHeaders,
+  body: body || "{}",
+});
 
   const text = await upstream.text();
   let parsed;
