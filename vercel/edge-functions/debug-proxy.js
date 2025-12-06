@@ -1,39 +1,27 @@
-// /api/debug-proxy.js - serverless Node function (Vercel will use Serverless runtime)
-export default async function handler(req, res) {
+export const config = { runtime: 'edge' };
+
+export default async function handler(request) {
   try {
-    // raw body
-    let raw = '';
-    try {
-      raw = await new Promise((resolve) => {
-        let data = '';
-        req.on('data', chunk => data += chunk);
-        req.on('end', () => resolve(data || ''));
-        req.on('error', () => resolve(''));
-      });
-    } catch (e) { raw = ''; }
+    const SECRET = process.env.PROXY_SECRET || null;
+    const TARGET = process.env.N8N_WEBHOOK_URL || null;
+    const INTERNAL = process.env.INTERNAL_AUTH_TOKEN || null;
 
-    // collect headers
+    const rawBody = await request.text().catch(()=> "");
     const headers = {};
-    for (const k in req.headers) headers[k] = req.headers[k];
+    request.headers.forEach((v,k)=> headers[k]=v);
 
-    // env presence and values (do NOT print secret values)
-    const envInfo = {
-      PROXY_SECRET_SET: !!process.env.PROXY_SECRET,
-      N8N_WEBHOOK_URL: process.env.N8N_WEBHOOK_URL || null,
-      INTERNAL_AUTH_TOKEN_SET: !!process.env.INTERNAL_AUTH_TOKEN
-    };
-
-    res.setHeader('Content-Type', 'application/json');
-    return res.status(200).send(JSON.stringify({
+    return new Response(JSON.stringify({
       debug: true,
-      envInfo,
-      requestUrl: req.url,
-      method: req.method,
-      headers,
-      rawBody: raw
-    }, null, 2));
+      env: { PROXY_SECRET_SET: !!SECRET, N8N_WEBHOOK_URL: TARGET || null, INTERNAL_AUTH_TOKEN_SET: !!INTERNAL },
+      receivedHeaders: headers,
+      rawBody,
+      requestUrl: request.url
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    });
   } catch (err) {
-    res.setHeader('Content-Type', 'application/json');
-    return res.status(500).send(JSON.stringify({ error: String(err) }));
+    return new Response(JSON.stringify({ error: "proxy-debug-crash", details: String(err) }), { status: 500, headers: { "Content-Type":"application/json" }});
   }
 }
+
