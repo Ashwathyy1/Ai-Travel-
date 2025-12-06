@@ -31,32 +31,27 @@ export default async function handler(request) {
     } catch (e) {
       body = "{}";
     }
+// Build forward URL and append proxy token as a query param
+const forwardUrl = new URL(TARGET);
+const incomingUrl = new URL(request.url);
+incomingUrl.searchParams.forEach((v, k) => forwardUrl.searchParams.append(k, v));
 
-    // Build forward URL
-    const forwardUrl = new URL(TARGET);
+// Append token in query so n8n always receives it (safer vs custom headers)
+if (process.env.INTERNAL_AUTH_TOKEN) {
+  forwardUrl.searchParams.set('_proxy_token', process.env.INTERNAL_AUTH_TOKEN);
+}
 
-    // -------------------------
-    // Build headers for n8n
-    // -------------------------
-    const forwardHeaders = new Headers();
-    forwardHeaders.set("Content-Type", request.headers.get("content-type") || "application/json");
+// Prepare headers (marker optional)
+const forwardHeaders = new Headers();
+forwardHeaders.set('Content-Type', request.headers.get('content-type') || 'application/json');
+forwardHeaders.set('x-from-proxy', 'vercel-proxy');
 
-    // Proxy marker used by n8n
-    forwardHeaders.set("x-from-proxy", "vercel-proxy");
-
-    // ★ IMPORTANT: send Authorization: Bearer <token>
-    if (INTERNAL) {
-      forwardHeaders.set("Authorization", `Bearer ${INTERNAL}`);
-    }
-
-    // -------------------------
-    // Forward the request to n8n
-    // -------------------------
-    const upstream = await fetch(forwardUrl.toString(), {
-      method: request.method,
-      headers: forwardHeaders,
-      body: body || "{}",
-    });
+// Forward request
+const upstream = await fetch(forwardUrl.toString(), {
+  method: request.method,
+  headers: forwardHeaders,
+  body: body || "{}",
+});
 
     // Read upstream response
     const txt = await upstream.text();
