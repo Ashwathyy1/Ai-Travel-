@@ -2,27 +2,39 @@ export const config = { runtime: 'edge' };
 
 export default async function handler(request) {
   try {
-    const SECRET = process.env.PROXY_SECRET || null;
-    const TARGET = process.env.N8N_WEBHOOK_URL || null;
-    const INTERNAL = process.env.INTERNAL_AUTH_TOKEN || null;
+    const SECRET = process.env.PROXY_SECRET;
+    const TARGET = process.env.N8N_WEBHOOK_URL;
 
-    // Read incoming raw body & headers
-    const rawBody = await request.text().catch(()=> "");
-    const headers = {};
-    request.headers.forEach((v,k)=> headers[k]=v);
+    // Validate secret
+    const incomingSecret = request.headers.get("x-proxy-secret");
+    if (!incomingSecret || incomingSecret !== SECRET) {
+      return new Response(JSON.stringify({ error: "Unauthorized - invalid proxy secret" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
 
-    // Return everything right away (no upstream fetch) so we can inspect
-    return new Response(JSON.stringify({
-      debug: true,
-      env: { PROXY_SECRET: !!SECRET, N8N_WEBHOOK_URL: TARGET ? TARGET : null, INTERNAL_AUTH_TOKEN: !!INTERNAL },
-      receivedHeaders: headers,
-      rawBody,
-      requestUrl: request.url
-    }), {
-      status: 200,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    // Read body
+    const rawBody = await request.text();
+    
+    // Forward request to Make.com webhook
+    const makeResp = await fetch(TARGET, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: rawBody
     });
+
+    const makeData = await makeResp.text();
+
+    return new Response(makeData, {
+      status: makeResp.status,
+      headers: { "Content-Type": "application/json" }
+    });
+
   } catch (err) {
-    return new Response(JSON.stringify({ error: "proxy-debug-crash", details: String(err) }), { status: 500, headers: { "Content-Type":"application/json" }});
+    return new Response(JSON.stringify({ error: "proxy-forward-error", details: String(err) }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" }
+    });
   }
 }
